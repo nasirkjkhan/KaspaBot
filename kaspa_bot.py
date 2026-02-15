@@ -96,7 +96,7 @@ class KaspaBot:
         welcome_message = (
             "🚀 *Welcome to Kaspa Wallet Monitor Bot!*\n\n"
             "This bot monitors your Kaspa wallet addresses and notifies you "
-            "of incoming transactions.\n\n"
+            "of incoming and outgoing transactions.\n\n"
             "Use the buttons below to:\n"
             "• Add wallet addresses to monitor\n"
             "• View your monitored wallets\n"
@@ -179,7 +179,6 @@ class KaspaBot:
         if wallet_address not in self.notified_transactions:
             self.notified_transactions[wallet_address] = set()
             # Fetch current transactions and mark them as already notified
-            # This prevents spam of old transactions
             await self.initialize_wallet_history(wallet_address)
         
         self.save_wallets()
@@ -199,11 +198,11 @@ class KaspaBot:
                 transactions = await self.check_transactions(session, wallet_address)
                 if transactions and isinstance(transactions, list):
                     # Mark all existing transactions as already notified
-                    for tx in transactions[:50]:  # Track last 50 transactions
+                    for tx in transactions[:50]:
                         tx_hash = tx.get('transaction_id', '')
                         if tx_hash:
                             self.notified_transactions[wallet_address].add(tx_hash)
-                    logger.info(f"Initialized {len(transactions[:50])} existing transactions for {wallet_address}")
+                    logger.info(f"Initialized {len(transactions[:50])} existing transactions for {wallet_address[:20]}...")
         except Exception as e:
             logger.error(f"Error initializing wallet history: {e}")
     
@@ -248,7 +247,6 @@ class KaspaBot:
         
         if wallet_address in self.wallets[chat_id]:
             self.wallets[chat_id].remove(wallet_address)
-            # Keep transaction history in case they re-add the wallet
             self.save_wallets()
             
             await update.message.reply_text(
@@ -293,7 +291,6 @@ class KaspaBot:
     async def check_transactions(self, session: aiohttp.ClientSession, wallet_address: str):
         """Check for new transactions on a wallet"""
         try:
-            # Using Kaspa API to get transactions
             url = f"{KASPA_API_BASE}/addresses/{wallet_address}/full-transactions"
             
             async with session.get(url, timeout=10) as response:
@@ -301,37 +298,50 @@ class KaspaBot:
                     data = await response.json()
                     return data
                 else:
-                    logger.warning(f"API returned status {response.status} for {wallet_address}")
+                    logger.warning(f"API returned status {response.status} for {wallet_address[:20]}...")
                     return None
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout checking transactions for {wallet_address[:20]}...")
+            return None
         except Exception as e:
-            logger.error(f"Error checking transactions for {wallet_address}: {e}")
+            logger.error(f"Error checking transactions: {e}")
             return None
     
     async def monitor_wallets(self, application):
         """Background task to monitor all wallets"""
-        logger.info("Starting wallet monitoring...")
+        logger.info("🔍 Starting wallet monitoring...")
+        
+        # Wait a bit before starting monitoring
+        await asyncio.sleep(5)
         
         while True:
             try:
-                async with aiohttp.ClientSession() as session:
-                    for chat_id, wallets in self.wallets.items():
-                        for wallet_address in wallets:
-                            # Check for new transactions
-                            transactions = await self.check_transactions(session, wallet_address)
-                            
-                            if transactions:
-                                # Process and send notifications for NEW transactions only
-                                await self.process_transactions(
-                                    application, 
-                                    chat_id, 
-                                    wallet_address, 
-                                    transactions
-                                )
-                            
-                            # Small delay between checks
-                            await asyncio.sleep(1)
+                if not self.wallets:
+                    logger.debug("No wallets to monitor, sleeping...")
+                    await asyncio.sleep(30)
+                    continue
                 
-                # Wait before next monitoring cycle (e.g., every 30 seconds)
+                async with aiohttp.ClientSession() as session:
+                    for chat_id, wallets in list(self.wallets.items()):
+                        for wallet_address in wallets:
+                            try:
+                                # Check for new transactions
+                                transactions = await self.check_transactions(session, wallet_address)
+                                
+                                if transactions:
+                                    await self.process_transactions(
+                                        application, 
+                                        chat_id, 
+                                        wallet_address, 
+                                        transactions
+                                    )
+                                
+                                # Small delay between checks
+                                await asyncio.sleep(2)
+                            except Exception as e:
+                                logger.error(f"Error checking wallet {wallet_address[:20]}: {e}")
+                
+                # Wait before next monitoring cycle
                 await asyncio.sleep(30)
                 
             except Exception as e:
@@ -341,86 +351,115 @@ class KaspaBot:
     async def process_transactions(self, application, chat_id, wallet_address, transactions):
         """Process transactions and send notifications for NEW transactions only"""
         try:
-            if isinstance(transactions, list):
-                # Check each transaction
-                for tx in transactions[:10]:  # Check last 10 transactions
-                    tx_hash = tx.get('transaction_id', '')
+            if not isinstance(transactions, list):
+                logger.warning(f"Unexpected transaction format: {type(transactions)}")
+                return
+            
+            new_tx_count = 0
+            for tx in transactions[:10]:
+                if not isinstance(tx, dict):
+                    continue
                     
-                    # Skip if already notified
-                    if tx_hash and not self.is_transaction_notified(wallet_address, tx_hash):
-                        # This is a NEW transaction - send notification
+                tx_hash = tx.get('transaction_id', '')
+                
+                if not tx_hash:
+                    continue
+                
+                # Skip if already notified
+                if not self.is_transaction_notified(wallet_address, tx_hash):
+                    try:
                         await self.send_transaction_notification(
                             application,
                             chat_id,
                             wallet_address,
                             tx
                         )
-                        # Mark as notified
                         self.mark_transaction_notified(wallet_address, tx_hash)
-                        
-                        # Small delay between notifications
+                        new_tx_count += 1
                         await asyncio.sleep(0.5)
+                    except Exception as e:
+                        logger.error(f"Error sending notification for tx {tx_hash[:16]}: {e}")
+            
+            if new_tx_count > 0:
+                logger.info(f"✅ Sent {new_tx_count} new transaction notification(s) to chat {chat_id}")
+                
         except Exception as e:
             logger.error(f"Error processing transactions: {e}")
     
     async def send_transaction_notification(self, application, chat_id, wallet_address, transaction):
         """Send notification for a transaction"""
         try:
-            # Extract transaction details (adapt based on actual API response)
-            tx_hash = transaction.get('transaction_id', 'N/A')
+            if not isinstance(transaction, dict):
+                logger.error("Transaction is not a dictionary")
+                return
             
-            # Simplified - you'll need to parse the actual transaction structure
+            tx_hash = transaction.get('transaction_id', 'Unknown')
             inputs = transaction.get('inputs', [])
             outputs = transaction.get('outputs', [])
             
+            if not inputs or not outputs:
+                logger.warning(f"Transaction {tx_hash[:16]} has no inputs or outputs")
+                return
+            
             # Determine if incoming or outgoing
-            is_incoming = any(
-                output.get('script_public_key_address') == wallet_address 
-                for output in outputs
-            )
+            is_incoming = False
+            amount = 0
+            from_address = "Unknown"
+            to_address = "Unknown"
             
-            if is_incoming:
-                # Incoming transaction
-                from_address = inputs[0].get('previous_outpoint_address', 'Unknown') if inputs else 'Unknown'
-                to_address = wallet_address
-                amount = sum(
-                    output.get('amount', 0) 
-                    for output in outputs 
-                    if output.get('script_public_key_address') == wallet_address
-                )
-            else:
-                # Outgoing transaction
+            # Check if this is an incoming transaction
+            for output in outputs:
+                if not isinstance(output, dict):
+                    continue
+                output_addr = output.get('script_public_key_address', '')
+                if output_addr == wallet_address:
+                    is_incoming = True
+                    amount += output.get('amount', 0)
+                    to_address = wallet_address
+                    # Get sender from first input
+                    if inputs and isinstance(inputs[0], dict):
+                        from_address = inputs[0].get('previous_outpoint_address', 'Unknown')
+            
+            # If not incoming, it's outgoing
+            if not is_incoming:
                 from_address = wallet_address
-                to_address = outputs[0].get('script_public_key_address', 'Unknown') if outputs else 'Unknown'
-                amount = sum(output.get('amount', 0) for output in outputs)
+                if outputs and isinstance(outputs[0], dict):
+                    to_address = outputs[0].get('script_public_key_address', 'Unknown')
+                    amount = sum(o.get('amount', 0) for o in outputs if isinstance(o, dict))
             
-            # Convert amount from sompi to KAS (1 KAS = 100,000,000 sompi)
+            # Convert from sompi to KAS
             amount_kas = amount / 100000000
             
             # Create explorer link
             explorer_link = f"{KASPA_EXPLORER_URL}/txs/{tx_hash}"
             
-            # Format notification message
+            # Format addresses
+            from_short = f"{from_address[:15]}...{from_address[-8:]}" if len(from_address) > 25 else from_address
+            to_short = f"{to_address[:15]}...{to_address[-8:]}" if len(to_address) > 25 else to_address
+            tx_short = f"{tx_hash[:16]}..." if len(tx_hash) > 20 else tx_hash
+            
             direction = "📥 Incoming" if is_incoming else "📤 Outgoing"
+            
             message = (
-                f"🔔 *{direction} Transaction Detected!*\n\n"
-                f"💰 *Amount:* {amount_kas:.8f} KAS\n"
-                f"📤 *From:* `{from_address[:20]}...`\n"
-                f"📥 *To:* `{to_address[:20]}...`\n"
-                f"🔗 *TX Hash:* `{tx_hash[:20]}...`\n\n"
+                f"🔔 *{direction} Transaction!*\n\n"
+                f"💰 *Amount:* `{amount_kas:.8f}` KAS\n"
+                f"📤 *From:* `{from_short}`\n"
+                f"📥 *To:* `{to_short}`\n"
+                f"🔗 *TX:* `{tx_short}`\n\n"
                 f"[View on Explorer]({explorer_link})"
             )
             
             await application.bot.send_message(
                 chat_id=chat_id,
                 text=message,
-                parse_mode='Markdown'
+                parse_mode='Markdown',
+                disable_web_page_preview=True
             )
             
-            logger.info(f"✅ Sent NEW transaction notification: {tx_hash[:16]}... to chat {chat_id}")
+            logger.info(f"✅ Notification sent for {direction.lower()} tx: {tx_hash[:16]}")
             
         except Exception as e:
-            logger.error(f"Error sending notification: {e}")
+            logger.error(f"Error sending notification: {e}", exc_info=True)
 
 async def post_init(application):
     """Post initialization - start monitoring task"""
@@ -437,7 +476,7 @@ def main():
     TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
     
     if not TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN environment variable not set!")
+        logger.error("❌ TELEGRAM_BOT_TOKEN environment variable not set!")
         return
     
     # Create bot instance
@@ -455,8 +494,8 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot_instance.handle_text))
     
     # Start bot
-    logger.info("🚀 Kaspa Bot Starting...")
-    logger.info("📡 Ready to monitor wallets for NEW transactions")
+    logger.info("🚀 Kaspa Telegram Bot Started!")
+    logger.info("📡 Monitoring system initialized")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
