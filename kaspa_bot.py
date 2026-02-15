@@ -22,35 +22,68 @@ class KaspaBot:
     def __init__(self, token):
         self.token = token
         self.wallets = {}  # {chat_id: [wallet_addresses]}
-        self.last_checked = {}  # {wallet_address: timestamp}
+        self.notified_transactions = {}  # {wallet_address: set(tx_hashes)}
         self.data_file = "wallets_data.json"
         self.load_wallets()
         
     def load_wallets(self):
-        """Load saved wallet addresses from file"""
+        """Load saved wallet addresses and notified transactions from file"""
         try:
             if os.path.exists(self.data_file):
                 with open(self.data_file, 'r') as f:
                     data = json.load(f)
                     self.wallets = {int(k): v for k, v in data.get('wallets', {}).items()}
-                    self.last_checked = data.get('last_checked', {})
+                    
+                    # Load notified transactions as sets
+                    notified_data = data.get('notified_transactions', {})
+                    self.notified_transactions = {
+                        k: set(v) for k, v in notified_data.items()
+                    }
+                    
                     logger.info(f"Loaded {len(self.wallets)} wallet configurations")
+                    logger.info(f"Loaded {sum(len(v) for v in self.notified_transactions.values())} tracked transactions")
         except Exception as e:
             logger.error(f"Error loading wallets: {e}")
             self.wallets = {}
-            self.last_checked = {}
+            self.notified_transactions = {}
     
     def save_wallets(self):
-        """Save wallet addresses to file"""
+        """Save wallet addresses and notified transactions to file"""
         try:
+            # Convert sets to lists for JSON serialization
+            notified_data = {
+                k: list(v) for k, v in self.notified_transactions.items()
+            }
+            
             with open(self.data_file, 'w') as f:
                 json.dump({
                     'wallets': self.wallets,
-                    'last_checked': self.last_checked
+                    'notified_transactions': notified_data
                 }, f)
-            logger.info("Wallets saved successfully")
+            logger.info("Wallets and transaction history saved successfully")
         except Exception as e:
             logger.error(f"Error saving wallets: {e}")
+    
+    def is_transaction_notified(self, wallet_address, tx_hash):
+        """Check if a transaction has already been notified"""
+        if wallet_address not in self.notified_transactions:
+            self.notified_transactions[wallet_address] = set()
+        return tx_hash in self.notified_transactions[wallet_address]
+    
+    def mark_transaction_notified(self, wallet_address, tx_hash):
+        """Mark a transaction as notified"""
+        if wallet_address not in self.notified_transactions:
+            self.notified_transactions[wallet_address] = set()
+        
+        self.notified_transactions[wallet_address].add(tx_hash)
+        
+        # Keep only last 1000 transactions per wallet to prevent unlimited growth
+        if len(self.notified_transactions[wallet_address]) > 1000:
+            # Remove oldest 200 transactions
+            sorted_txs = sorted(self.notified_transactions[wallet_address])
+            self.notified_transactions[wallet_address] = set(sorted_txs[-800:])
+        
+        self.save_wallets()
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -141,15 +174,38 @@ class KaspaBot:
             return
         
         self.wallets[chat_id].append(wallet_address)
-        self.last_checked[wallet_address] = datetime.now().isoformat()
+        
+        # Initialize notified transactions for this wallet (mark existing txs as already seen)
+        if wallet_address not in self.notified_transactions:
+            self.notified_transactions[wallet_address] = set()
+            # Fetch current transactions and mark them as already notified
+            # This prevents spam of old transactions
+            await self.initialize_wallet_history(wallet_address)
+        
         self.save_wallets()
         
         await update.message.reply_text(
             f"✅ *Wallet added successfully!*\n\n"
             f"Address: `{wallet_address}`\n\n"
-            f"You'll now receive notifications for all transactions to this address.",
+            f"🔔 You'll now receive notifications for NEW transactions only.\n"
+            f"(Existing transactions have been marked as seen)",
             parse_mode='Markdown'
         )
+    
+    async def initialize_wallet_history(self, wallet_address):
+        """Initialize transaction history to prevent notification spam"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                transactions = await self.check_transactions(session, wallet_address)
+                if transactions and isinstance(transactions, list):
+                    # Mark all existing transactions as already notified
+                    for tx in transactions[:50]:  # Track last 50 transactions
+                        tx_hash = tx.get('transaction_id', '')
+                        if tx_hash:
+                            self.notified_transactions[wallet_address].add(tx_hash)
+                    logger.info(f"Initialized {len(transactions[:50])} existing transactions for {wallet_address}")
+        except Exception as e:
+            logger.error(f"Error initializing wallet history: {e}")
     
     async def list_wallets(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle listing all monitored wallets"""
@@ -192,8 +248,7 @@ class KaspaBot:
         
         if wallet_address in self.wallets[chat_id]:
             self.wallets[chat_id].remove(wallet_address)
-            if wallet_address in self.last_checked:
-                del self.last_checked[wallet_address]
+            # Keep transaction history in case they re-add the wallet
             self.save_wallets()
             
             await update.message.reply_text(
@@ -239,7 +294,6 @@ class KaspaBot:
         """Check for new transactions on a wallet"""
         try:
             # Using Kaspa API to get transactions
-            # Note: Replace with actual Kaspa API endpoint
             url = f"{KASPA_API_BASE}/addresses/{wallet_address}/full-transactions"
             
             async with session.get(url, timeout=10) as response:
@@ -266,7 +320,7 @@ class KaspaBot:
                             transactions = await self.check_transactions(session, wallet_address)
                             
                             if transactions:
-                                # Process and send notifications
+                                # Process and send notifications for NEW transactions only
                                 await self.process_transactions(
                                     application, 
                                     chat_id, 
@@ -285,17 +339,27 @@ class KaspaBot:
                 await asyncio.sleep(60)
     
     async def process_transactions(self, application, chat_id, wallet_address, transactions):
-        """Process transactions and send notifications"""
+        """Process transactions and send notifications for NEW transactions only"""
         try:
-            # This is a simplified version - adapt based on actual Kaspa API response
             if isinstance(transactions, list):
-                for tx in transactions[:5]:  # Limit to recent 5 transactions
-                    await self.send_transaction_notification(
-                        application,
-                        chat_id,
-                        wallet_address,
-                        tx
-                    )
+                # Check each transaction
+                for tx in transactions[:10]:  # Check last 10 transactions
+                    tx_hash = tx.get('transaction_id', '')
+                    
+                    # Skip if already notified
+                    if tx_hash and not self.is_transaction_notified(wallet_address, tx_hash):
+                        # This is a NEW transaction - send notification
+                        await self.send_transaction_notification(
+                            application,
+                            chat_id,
+                            wallet_address,
+                            tx
+                        )
+                        # Mark as notified
+                        self.mark_transaction_notified(wallet_address, tx_hash)
+                        
+                        # Small delay between notifications
+                        await asyncio.sleep(0.5)
         except Exception as e:
             logger.error(f"Error processing transactions: {e}")
     
@@ -353,6 +417,8 @@ class KaspaBot:
                 parse_mode='Markdown'
             )
             
+            logger.info(f"✅ Sent NEW transaction notification: {tx_hash[:16]}... to chat {chat_id}")
+            
         except Exception as e:
             logger.error(f"Error sending notification: {e}")
 
@@ -389,7 +455,8 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot_instance.handle_text))
     
     # Start bot
-    logger.info("Starting bot...")
+    logger.info("🚀 Kaspa Bot Starting...")
+    logger.info("📡 Ready to monitor wallets for NEW transactions")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
